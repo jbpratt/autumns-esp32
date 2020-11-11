@@ -1,12 +1,15 @@
 #include <stdio.h>
 
+#include "cJSON.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_spi_flash.h"
 #include "esp_system.h"
+#include "esp_websocket_client.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
@@ -18,9 +21,24 @@
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT BIT1
 
+#define NO_DATA_TIMEOUT_SEC 60
+
 static EventGroupHandle_t s_wifi_event_group;
 static const char *TAG = "APP";
 static const char *WIFI_TAG = "WIFI";
+static const char *WS_TAG = "WEBSOCKET";
+
+extern const uint8_t server_cert_pem_start[] asm("_binary_ca_cert_pem_start");
+extern const uint8_t server_cert_pem_end[] asm("_binary_ca_cert_pem_end");
+
+static TimerHandle_t shutdown_signal_timer;
+static SemaphoreHandle_t shutdown_sema;
+
+static void shutdown_signaler(TimerHandle_t xTimer) {
+  ESP_LOGI(WS_TAG, "No data received for %d seconds, signaling shutdown",
+           NO_DATA_TIMEOUT_SEC);
+  xSemaphoreGive(shutdown_sema);
+}
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data) {
@@ -87,6 +105,87 @@ void init_wifi(void) {
   vEventGroupDelete(s_wifi_event_group);
 }
 
+static void websocket_event_handler(void *handler_args, esp_event_base_t base,
+                                    int32_t event_id, void *event_data) {
+  esp_websocket_event_data_t *data = (esp_websocket_event_data_t *)event_data;
+  switch (event_id) {
+    case WEBSOCKET_EVENT_CONNECTED:
+      ESP_LOGI(WS_TAG, "WEBSOCKET_EVENT_CONNECTED");
+      break;
+    case WEBSOCKET_EVENT_DISCONNECTED:
+      ESP_LOGI(WS_TAG, "WEBSOCKET_EVENT_DISCONNECTED");
+      break;
+    case WEBSOCKET_EVENT_DATA:
+      ESP_LOGI(WS_TAG, "WEBSOCKET_EVENT_DATA: Received opcode=%d",
+               data->op_code);
+      ESP_LOGW(
+          WS_TAG,
+          "Total payload length=%d, data_len=%d, current payload offset=%d\r\n",
+          data->payload_len, data->data_len, data->payload_offset);
+
+      char type[12];
+      char *rendered;
+      cJSON *root;
+
+      sscanf((char *)data->data_ptr, "%11s", type);
+      if (strcmp(type, "JOIN") == 0) {
+        root = cJSON_Parse((char *)data->data_ptr + 5);
+        rendered = cJSON_Print(root);
+        ESP_LOGI(WS_TAG, "Join: %s\n", rendered);
+        cJSON_Delete(root);
+      } else if (strcmp(type, "QUIT") == 0) {
+        root = cJSON_Parse((char *)data->data_ptr + 5);
+        rendered = cJSON_Print(root);
+        ESP_LOGI(WS_TAG, "Quit: %s\n", rendered);
+        cJSON_Delete(root);
+      } else if (strcmp(type, "VIEWERSTATE") == 0) {
+        root = cJSON_Parse((char *)data->data_ptr + 11);
+        rendered = cJSON_Print(root);
+        ESP_LOGI(WS_TAG, "Viewerstate: %s\n", rendered);
+        cJSON_Delete(root);
+      } else if (strcmp(type, "MSG") == 0) {
+        root = cJSON_Parse((char *)data->data_ptr + 4);
+        rendered = cJSON_Print(root);
+        ESP_LOGI(WS_TAG, "Msg: %s\n", rendered);
+        cJSON_Delete(root);
+      }
+
+      xTimerReset(shutdown_signal_timer, portMAX_DELAY);
+      break;
+    case WEBSOCKET_EVENT_ERROR:
+      ESP_LOGI(WS_TAG, "WEBSOCKET_EVENT_ERROR");
+      break;
+  }
+}
+
+void init_ws(void) {
+  const esp_websocket_client_config_t websocket_cfg = {
+      .uri = CONFIG_WEBSOCKET_URI,
+      .cert_pem = (const char *)server_cert_pem_start,
+  };
+
+  shutdown_signal_timer =
+      xTimerCreate("Websocket shutdown timer",
+                   NO_DATA_TIMEOUT_SEC * 1000 / portTICK_PERIOD_MS, pdFALSE,
+                   NULL, shutdown_signaler);
+  shutdown_sema = xSemaphoreCreateBinary();
+
+  esp_websocket_client_handle_t client =
+      esp_websocket_client_init(&websocket_cfg);
+  esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY,
+                                websocket_event_handler, (void *)client);
+
+  esp_websocket_client_start(client);
+
+  while (esp_websocket_client_is_connected(client)) {
+  }
+
+  xSemaphoreTake(shutdown_sema, portMAX_DELAY);
+  esp_websocket_client_stop(client);
+  ESP_LOGI(WS_TAG, "Websocket Stopped");
+  esp_websocket_client_destroy(client);
+}
+
 void app_main(void) {
   ESP_LOGI(TAG, "Startup..");
   ESP_LOGI(TAG, "Free memory: %d bytes", esp_get_free_heap_size());
@@ -95,4 +194,6 @@ void app_main(void) {
   ESP_ERROR_CHECK(nvs_flash_init());
   ESP_LOGI(TAG, "Configured WiFi SSID is %s\n", CONFIG_ESP_WIFI_SSID);
   init_wifi();
+
+  init_ws();
 }

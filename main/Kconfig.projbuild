@@ -12,4 +12,8 @@ menu "AWS IOT ESP32 Configuration"
     config ESP_HOSTNAME
         string "Hostname for device"
         default "autumns-esp32"
+
+    config WEBSOCKET_URI
+        string "Websocket to connect to"
+        default "wss://chat.strims.gg/ws"
 endmenu
