@@ -1,4 +1,4 @@
-menu "AWS IOT ESP32 Configuration"
+menu "Autumn's ESP32 Configuration"
     config ESP_WIFI_SSID
         string "WiFi SSID"
         help
@@ -16,4 +16,8 @@ menu "AWS IOT ESP32 Configuration"
     config WEBSOCKET_URI
         string "Websocket to connect to"
         default "wss://chat.strims.gg/ws"
+
+    config ENABLE_BME280_SENSOR
+        bool "Enable BME280 sensor"
+        default n
 endmenu
