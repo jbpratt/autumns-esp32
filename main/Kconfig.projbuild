@@ -20,4 +20,8 @@ menu "Autumn's ESP32 Configuration"
     config ENABLE_BME280_SENSOR
         bool "Enable BME280 sensor"
         default n
+
+    config ENABLE_BME680_SENSOR
+        bool "Enable BME680 sensor"
+        default n
 endmenu
