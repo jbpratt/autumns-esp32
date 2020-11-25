@@ -1,59 +1,38 @@
 #include <stdio.h>
 
-#include "cJSON.h"
+#include "bme680_sensor.h"
 #include "driver/i2c.h"
 #include "esp_event.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
-#include "esp_spi_flash.h"
 #include "esp_system.h"
-#include "esp_websocket_client.h"
-#include "esp_wifi.h"
+#include "esp_tls.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/event_groups.h"
-#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "iot_bme280.h"
 #include "iot_i2c_bus.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
+#include "wifi.h"
 
 #ifdef CONFIG_IDF_TARGET_ESP32
 #define CHIP_NAME "ESP32"
 #endif
-
-#define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT BIT1
-
-// Websocket timeout if no data is received
-#define NO_DATA_TIMEOUT_SEC 60
 
 // HTTP settings
 #define MAX_HTTP_RECV_BUFFER 512
 #define MAX_HTTP_OUTPUT_BUFFER 2048
 
 static const char *TAG = "APP";
-static const char *WIFI_TAG = "WIFI";
-static const char *WS_TAG = "WEBSOCKET";
 
 /*
 echo "" | openssl s_client -showcerts -connect strims.gg:443 | sed -n \
  "1,/Root/d; /BEGIN/,/END/p" | openssl x509 -outform PEM >certs/ca_cert.pem
 */
 // strims ssl cert
-extern const uint8_t ws_cert_pem_start[] asm("_binary_ca_cert_pem_start");
-extern const uint8_t ws_cert_pem_end[] asm("_binary_ca_cert_pem_end");
-// Websocket signaling
-static TimerHandle_t shutdown_signal_timer;
-static SemaphoreHandle_t shutdown_sema;
-
-#ifdef CONFIG_ENABLED_BME680_SENSOR
-static const char *BME680_TAG = "BME680";
-#endif
-
-// static const char *HTTP_TAG = "HTTP";
-
-static EventGroupHandle_t s_wifi_event_group;
+// extern const uint8_t ws_cert_pem_start[] asm("_binary_ca_cert_pem_start");
+// extern const uint8_t ws_cert_pem_end[] asm("_binary_ca_cert_pem_end");
+static const char *HTTP_TAG = "HTTP";
 
 #ifdef CONFIG_ENABLE_BME280_SENSOR
 static const char *BME280_TAG = "BME280";
@@ -96,156 +75,101 @@ void bme280_init(void) {
 }
 #endif
 
-static void wifi_event_handler(void *arg, esp_event_base_t event_base,
-                               int32_t event_id, void *event_data) {
-  if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-    esp_err_t err =
-        tcpip_adapter_set_hostname(TCPIP_ADAPTER_IF_STA, CONFIG_ESP_HOSTNAME);
-    if (err != ESP_OK) {
-      ESP_LOGE(WIFI_TAG, "failed to set hostname: %d", err);
-    }
-    esp_wifi_connect();
-  } else if (event_base == WIFI_EVENT &&
-             event_id == WIFI_EVENT_STA_DISCONNECTED) {
-    xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-  } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-    ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-    ESP_LOGI(WIFI_TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
-    xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-  }
-}
+esp_err_t http_event_handler(esp_http_client_event_t *evt) {
+  static char *output_buffer;
+  static int output_len;
 
-void init_wifi(void) {
-  s_wifi_event_group = xEventGroupCreate();
-
-  ESP_ERROR_CHECK(esp_netif_init());
-  ESP_ERROR_CHECK(esp_event_loop_create_default());
-  esp_netif_create_default_wifi_sta();
-
-  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-  ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-  ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                             &wifi_event_handler, NULL));
-  ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                             &wifi_event_handler, NULL));
-
-  wifi_config_t wifi_config = {
-      .sta =
-          {
-              .ssid = CONFIG_ESP_WIFI_SSID,
-              .password = CONFIG_ESP_WIFI_PASSWORD,
-              .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-          },
-  };
-
-  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-  ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
-  ESP_ERROR_CHECK(esp_wifi_start());
-
-  EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-                                         WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-                                         pdFALSE, pdFALSE, portMAX_DELAY);
-
-  if (bits & WIFI_CONNECTED_BIT) {
-    ESP_LOGI(WIFI_TAG, "Connection established\n");
-  } else if (bits & WIFI_FAIL_BIT) {
-    ESP_LOGI(WIFI_TAG, "Failed to establish connection\n");
-  } else {
-    ESP_LOGE(WIFI_TAG, "UNEXPECTED EVENT");
-  }
-
-  ESP_ERROR_CHECK(esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                               &wifi_event_handler));
-  ESP_ERROR_CHECK(esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                               &wifi_event_handler));
-  vEventGroupDelete(s_wifi_event_group);
-}
-
-static void ws_shutdown_signaler(TimerHandle_t xTimer) {
-  ESP_LOGI(WS_TAG, "No data received for %d seconds, signaling shutdown",
-           NO_DATA_TIMEOUT_SEC);
-  xSemaphoreGive(shutdown_sema);
-}
-
-static void websocket_event_handler(void *handler_args, esp_event_base_t base,
-                                    int32_t event_id, void *event_data) {
-  esp_websocket_event_data_t *data = (esp_websocket_event_data_t *)event_data;
-  switch (event_id) {
-    case WEBSOCKET_EVENT_CONNECTED:
-      ESP_LOGI(WS_TAG, "WEBSOCKET_EVENT_CONNECTED");
+  switch (evt->event_id) {
+    case HTTP_EVENT_ERROR:
+      ESP_LOGD(HTTP_TAG, "HTTP_EVENT_ERROR");
       break;
-    case WEBSOCKET_EVENT_DISCONNECTED:
-      ESP_LOGI(WS_TAG, "WEBSOCKET_EVENT_DISCONNECTED");
+    case HTTP_EVENT_ON_CONNECTED:
+      ESP_LOGD(HTTP_TAG, "HTTP_EVENT_ON_CONNECTED");
       break;
-    case WEBSOCKET_EVENT_DATA:
-      ESP_LOGI(WS_TAG, "WEBSOCKET_EVENT_DATA: Received opcode=%d",
-               data->op_code);
-      ESP_LOGW(
-          WS_TAG,
-          "Total payload length=%d, data_len=%d, current payload offset=%d\r\n",
-          data->payload_len, data->data_len, data->payload_offset);
-
-      char type[12];
-      char *rendered;
-      cJSON *root;
-
-      sscanf((char *)data->data_ptr, "%11s", type);
-      if (strcmp(type, "JOIN") == 0) {
-        root = cJSON_Parse((char *)data->data_ptr + 5);
-        rendered = cJSON_Print(root);
-        ESP_LOGI(WS_TAG, "Join: %s\n", rendered);
-        cJSON_Delete(root);
-      } else if (strcmp(type, "QUIT") == 0) {
-        root = cJSON_Parse((char *)data->data_ptr + 5);
-        rendered = cJSON_Print(root);
-        ESP_LOGI(WS_TAG, "Quit: %s\n", rendered);
-        cJSON_Delete(root);
-      } else if (strcmp(type, "VIEWERSTATE") == 0) {
-        root = cJSON_Parse((char *)data->data_ptr + 11);
-        rendered = cJSON_Print(root);
-        ESP_LOGI(WS_TAG, "Viewerstate: %s\n", rendered);
-        cJSON_Delete(root);
-      } else if (strcmp(type, "MSG") == 0) {
-        root = cJSON_Parse((char *)data->data_ptr + 4);
-        rendered = cJSON_Print(root);
-        ESP_LOGI(WS_TAG, "Msg: %s\n", rendered);
-        cJSON_Delete(root);
+    case HTTP_EVENT_HEADER_SENT:
+      ESP_LOGD(HTTP_TAG, "HTTP_EVENT_HEADER_SENT");
+      break;
+    case HTTP_EVENT_ON_HEADER:
+      ESP_LOGD(HTTP_TAG, "HTTP_EVENT_ON_HEADER, key=%s, value=%s",
+               evt->header_key, evt->header_value);
+      break;
+    case HTTP_EVENT_ON_DATA:
+      ESP_LOGD(HTTP_TAG, "HTTP_EVENT_ON_DATA, len%d", evt->data_len);
+      // check for chunked encoding
+      if (!esp_http_client_is_chunked_response(evt->client)) {
+        // If user_data buffer is configured, copy the response into the buffer
+        if (evt->user_data) {
+          memcpy(evt->user_data + output_len, evt->data, evt->data_len);
+        } else {
+          // if output_buffer is NULL, allocate needed memory and copy the data
+          if (!output_buffer) {
+            output_buffer =
+                (char *)malloc(esp_http_client_get_content_length(evt->client));
+            output_len = 0;
+            if (!output_buffer) {
+              ESP_LOGE(HTTP_TAG, "Failed to allocate memory for output buffer");
+              return ESP_FAIL;
+            }
+          }
+          memcpy(output_buffer + output_len, evt->data, evt->data_len);
+        }
+        output_len += evt->data_len;
       }
-
-      xTimerReset(shutdown_signal_timer, portMAX_DELAY);
       break;
-    case WEBSOCKET_EVENT_ERROR:
-      ESP_LOGI(WS_TAG, "WEBSOCKET_EVENT_ERROR");
+
+    case HTTP_EVENT_ON_FINISH:
+      ESP_LOGI(HTTP_TAG, "HTTP_EVENT_ON_FINISH");
+      if (output_buffer) {
+        free(output_buffer);
+        output_buffer = NULL;
+      }
+      output_len = 0;
+      break;
+
+    case HTTP_EVENT_DISCONNECTED:
+      ESP_LOGI(HTTP_TAG, "HTTP_EVENT_DISCONNECTED");
+      int mbedtls_err = 0;
+      esp_err_t err =
+          esp_tls_get_and_clear_last_error(evt->data, &mbedtls_err, NULL);
+      if (err != 0) {
+        if (output_buffer) {
+          free(output_buffer);
+          output_buffer = NULL;
+        }
+        output_len = 0;
+        ESP_LOGI(HTTP_TAG, "Last esp error code: 0x%x", err);
+        ESP_LOGI(HTTP_TAG, "Last mbedtls failure: 0x%x", mbedtls_err);
+      }
       break;
   }
+
+  return ESP_OK;
 }
 
-void init_ws(void) {
-  const esp_websocket_client_config_t websocket_cfg = {
-      .uri = CONFIG_WEBSOCKET_URI,
-      .cert_pem = (const char *)ws_cert_pem_start,
-  };
+void influx_post_data(char *data) {
+  char local_response_buffer[MAX_HTTP_OUTPUT_BUFFER] = {0};
 
-  shutdown_signal_timer =
-      xTimerCreate("Websocket shutdown timer",
-                   NO_DATA_TIMEOUT_SEC * 1000 / portTICK_PERIOD_MS, pdFALSE,
-                   NULL, ws_shutdown_signaler);
-  shutdown_sema = xSemaphoreCreateBinary();
+  esp_http_client_config_t conf = {.url = CONFIG_INFLUXDB_URI,
+                                   .event_handler = http_event_handler,
+                                   .user_data = local_response_buffer,
+                                   .method = HTTP_METHOD_POST};
 
-  esp_websocket_client_handle_t client =
-      esp_websocket_client_init(&websocket_cfg);
-  esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY,
-                                websocket_event_handler, (void *)client);
+  esp_http_client_handle_t client = esp_http_client_init(&conf);
+  esp_http_client_set_post_field(client, data, strlen(data));
 
-  esp_websocket_client_start(client);
-
-  while (esp_websocket_client_is_connected(client)) {
+  esp_err_t err = esp_http_client_perform(client);
+  if (err == ESP_OK) {
+    int status_code = esp_http_client_get_status_code(client);
+    ESP_LOGI(HTTP_TAG, "HTTP POST Status = %d, content_length = %d",
+             status_code, esp_http_client_get_content_length(client));
+  } else {
+    ESP_LOGE(HTTP_TAG, "HTTP POST request failed: %s", esp_err_to_name(err));
   }
 
-  xSemaphoreTake(shutdown_sema, portMAX_DELAY);
-  esp_websocket_client_stop(client);
-  ESP_LOGI(WS_TAG, "Websocket Stopped");
-  esp_websocket_client_destroy(client);
+  err = esp_http_client_cleanup(client);
+  if (err != ESP_OK) {
+    ESP_LOGE(HTTP_TAG, "HTTP client cleanup failed: %s", esp_err_to_name(err));
+  }
 }
 
 void app_main(void) {
@@ -257,12 +181,11 @@ void app_main(void) {
   ESP_LOGI(TAG, "Configured WiFi SSID is %s\n", CONFIG_ESP_WIFI_SSID);
   init_wifi();
 
-  init_ws();
 #if CONFIG_ENABLE_BME280_SENSOR
   bme280_init();
 #endif
 
 #ifdef CONFIG_ENABLE_BME680_SENSOR
-//
+  bme680_init();
 #endif
 }
